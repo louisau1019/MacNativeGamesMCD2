@@ -115,8 +115,11 @@ def nso_file(compress_text=False):
     return header + stored + ro + data
 
 
-def _nca(program, content=0, rights=None, past_end_section=False, encryption=3, body='ctr', indirect_size=0):
-    pfs = _partition([('main', program), ('main.npdm', b'META' + bytes(12))])
+def _nca(program=None, content=0, rights=None, past_end_section=False, encryption=3, body='ctr', indirect_size=0, files=None):
+    if files is None:
+        pfs = _partition([('main', program), ('main.npdm', b'META' + bytes(12))])
+    else:
+        pfs = _partition(files)
     block = 4096
     hashes = b''.join(hashlib.sha256(pfs[i:i + block]).digest() for i in range(0, len(pfs), block))
     pfsoff = (len(hashes) + 15) & ~15
@@ -369,6 +372,8 @@ class Probe(unittest.TestCase):
                 probe_metadata.probe(
                     nsp, keys, build, expected_sha256=hashlib.sha256(payload).hexdigest())
             message = str(caught.exception)
+            self.assertIn('file appears truncated: expected >= 4096 bytes', message)
+            self.assertNotIn('no in-range ExeFS', message)
             self.assertIn('program.nca section 0', message)
             self.assertIn('media_start 6', message)
             self.assertIn('media_end 8', message)
@@ -466,6 +471,97 @@ class Probe(unittest.TestCase):
         self.assertNotIn(CONTENT.hex(), message)
         self.assertNotIn(TITLEKEK.hex(), message)
         self.assertNotIn(MARKER.decode(), message)
+
+    def test_cnmt_attribute_byte_is_not_a_size_bit(self):
+        body = bytearray(0x20 + 0x38)
+        struct.pack_into('<HHH', body, 0x0E, 0, 1, 0)
+        body[0x20 + 0x30:0x20 + 0x36] = (100).to_bytes(6, 'little')
+        body[0x20 + 0x35] = 1
+        rows, listed, actual = probe_metadata.packaged_contents(bytes(body))
+        self.assertEqual(rows[0]['listed_size'], 100)
+        self.assertIsNone(listed)
+        self.assertIsNone(actual)
+        plain = bytearray(body)
+        plain[0x20 + 0x35] = 0
+        plain[0x20 + 0x30:0x20 + 0x36] = (100).to_bytes(6, 'little')
+        rows, _listed, _actual = probe_metadata.packaged_contents(bytes(plain))
+        self.assertEqual(rows[0]['listed_size'], 100)
+
+    def test_short_program_nca_prints_truncation_and_cnmt_hashes(self):
+        program_id = bytes.fromhex('a1cb976a3d212c3f2bc940f9ca153bff')
+        control_id = bytes.fromhex('6a7937b1e1713f271a73dca10739f50d')
+        meta_id = bytes.fromhex('5d93dc5bc32c5724a18c498d7c3d9552')
+        program = _shell_nca(0, 6, 8, pfs=True)
+        control = _shell_nca(2, 0, 0)
+        published = hashlib.sha256(b'published-program').digest()
+        control_hash = hashlib.sha256(control).digest()
+        header = bytearray(0x20)
+        struct.pack_into('<Q', header, 0, TITLE)
+        header[0xC] = 0x80
+        extended = bytes(0x10)
+        struct.pack_into('<H', header, 0x0E, len(extended))
+        struct.pack_into('<HH', header, 0x10, 2, 0)
+        blob = bytes(header) + extended
+        for digest, content_id, size, content_type in (
+            (published, program_id, 4096, 0),
+            (control_hash, control_id, len(control), 2),
+        ):
+            rec = bytearray(0x38)
+            rec[:0x20] = digest
+            rec[0x20:0x30] = content_id
+            rec[0x30:0x36] = size.to_bytes(6, 'little')
+            rec[0x36] = content_type
+            blob += bytes(rec)
+        cnmt = blob + hashlib.sha256(blob).digest()
+        meta = _nca(content=1, files=[(f'Application_{TITLE:016x}.cnmt', cnmt)])
+        payload = _partition([
+            (program_id.hex() + '.nca', program),
+            (control_id.hex() + '.nca', control),
+            (meta_id.hex() + '.cnmt.nca', meta),
+        ])
+        digest = hashlib.sha256(payload).hexdigest()
+        program_hash = hashlib.sha256(program).hexdigest()
+        old = probe_metadata.NSP_SHA256
+        probe_metadata.NSP_SHA256 = digest
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                nsp = root / 'game.nsp'
+                keys = root / 'prod.keys'
+                build = root / 'MCD2_build'
+                nsp.write_bytes(payload)
+                keys.write_text(self._keys())
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    status = probe_metadata.main([
+                        '--nsp', str(nsp), '--keys', str(keys), '--build-dir', str(build)])
+                text = err.getvalue()
+                self.assertEqual(status, 2, text)
+                self.assertLess(text.index('nca:'), text.index('section_end:'))
+                self.assertLess(text.index('section_end:'), text.index('section_header:'))
+                self.assertLess(text.index('section_header:'), text.index('cnmt:'))
+                self.assertLess(text.index('cnmt:'), text.index('probe:'))
+                self.assertIn('file appears truncated: expected >= 4096 bytes', text)
+                self.assertIn(
+                    f'cnmt: {program_id.hex()} content_type=0 listed_size=4096 '
+                    f'actual_size={len(program)} listed_sha256={published.hex()} '
+                    f'actual_sha256={program_hash}',
+                    text)
+                self.assertIn(
+                    f'cnmt: {control_id.hex()} content_type=2 listed_size={len(control)} '
+                    f'actual_size={len(control)} listed_sha256={control_hash.hex()} '
+                    f'actual_sha256={control_hash.hex()}',
+                    text)
+                self.assertIn('cnmt_digest:', text)
+                self.assertNotIn('no in-range ExeFS', text)
+                self.assertNotIn(MARKER.decode(), text)
+                self.assertNotIn(HEADER.hex(), text)
+                self.assertNotIn(CONTENT.hex(), text)
+                self.assertNotIn(TITLEKEK.hex(), text)
+                self.assertNotIn(cnmt.hex(), text)
+                self.assertEqual([path for path in build.rglob('*') if path.is_file()], [])
+        finally:
+            probe_metadata.NSP_SHA256 = old
 
 
 if __name__ == '__main__':

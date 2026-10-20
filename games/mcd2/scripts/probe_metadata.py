@@ -253,10 +253,86 @@ def nca_lines(records):
     ]
 
 
+def read_section_pfs(handle, keys, record, hdr, tickets, index, start, end):
+    """Decrypt one in-range PartitionFS / HierarchicalSha256 section. Callers print no section bytes."""
+    offset = record['nca_offset']
+    fs = hdr[0x400 + 512 * index:0x600 + 512 * index]
+    ticket = ticket_for(hdr, tickets)
+    line = section_crypto_line(record['name'], index, fs, ticket)
+    require(hashlib.sha256(fs).digest() == hdr[0x280 + 32 * index:0x2A0 + 32 * index],
+            f'{line} FS header hash mismatch')
+    crypt = fs[4]
+    indirect_size = struct.unpack_from('<Q', fs, 0x108)[0]
+    ex_size = struct.unpack_from('<Q', fs, 0x128)[0]
+    if crypt == 0:
+        crypt = 3
+    elif crypt in (4, 6):
+        if indirect_size or ex_size:
+            _fail(f'{line} bktr_indirect_size {indirect_size} bktr_ex_size {ex_size}')
+        crypt = 5 if crypt == 6 else 3
+    if crypt not in (1, 2, 3, 5):
+        _fail(line)
+    blocksize, levels = struct.unpack_from('<II', fs, 0x28)
+    hashoff, hashsize, pfsoff, pfssize = struct.unpack_from('<QQQQ', fs, 0x30)
+    secstart, secsize = start * 512, (end - start) * 512
+    require(levels == 2 and blocksize > 0 and pfssize <= 512 * 1024 * 1024,
+            f'{line} Unsupported hash layout')
+    key = None
+    if crypt == 2:
+        key = xts_key(hdr, keys, line)
+    elif crypt in (3, 5):
+        key = content_key(hdr, keys, ticket, line)
+
+    def section_read(relative, size, crypt=crypt, key=key, secstart=secstart, secsize=secsize):
+        require(0 <= relative and relative + size <= secsize, f'{line} Section read out of bounds')
+        absolute = secstart + relative
+
+        def raw_at(origin, length):
+            return read_at(handle, offset + origin, length)
+
+        def read_ctr(origin, length):
+            aligned = origin & ~15
+            iv = fs[0x140:0x148][::-1] + (aligned // 16).to_bytes(8, 'big')
+            data = raw_at(aligned, length + origin - aligned)
+            return decrypt(key, modes.CTR(iv), data)[origin - aligned:]
+
+        def read_xts(origin, length):
+            start_sector = origin & ~511
+            end_sector = (origin + length + 511) & ~511
+            blob = raw_at(secstart + start_sector, end_sector - start_sector)
+            plain = b''.join(
+                decrypt(key, modes.XTS(((start_sector // 512) + sector).to_bytes(16, 'big')),
+                        blob[sector * 512:(sector + 1) * 512])
+                for sector in range((end_sector - start_sector) // 512))
+            return plain[origin - start_sector:origin - start_sector + length]
+
+        if crypt == 1:
+            return raw_at(absolute, size)
+        if crypt == 2:
+            return read_xts(relative, size)
+        if crypt != 5 or relative >= pfsoff:
+            return read_ctr(absolute, size)
+        if relative + size <= pfsoff:
+            return raw_at(absolute, size)
+        head = pfsoff - relative
+        return raw_at(absolute, head) + read_ctr(absolute + head, size - head)
+
+    hashes = section_read(hashoff, hashsize)
+    require(hashlib.sha256(hashes).digest() == fs[8:40], f'{line} hash-table mismatch')
+    pfs = section_read(pfsoff, pfssize)
+    for block, pos in enumerate(range(0, pfssize, blocksize)):
+        expected = hashes[block * 32:(block + 1) * 32]
+        require(hashlib.sha256(pfs[pos:pos + blocksize]).digest() == expected,
+                f'{line} block hash mismatch: {block}')
+    try:
+        members = partition_entries(io.BytesIO(pfs), 0, len(pfs))
+    except ValueError as error:
+        _fail(f'{line} {error}')
+    return [(member, pfs[off:off + size]) for member, off, size in members]
+
+
 def exefs_members(game, keys, record, hdr, tickets):
     """ExeFS walk for the program NCA. Sections that do not fit in the file are skipped."""
-    offset = record['nca_offset']
-    ticket = ticket_for(hdr, tickets)
     skipped = []
     with game.open('rb') as handle:
         for index, start, end in section_rows(hdr):
@@ -264,86 +340,194 @@ def exefs_members(game, keys, record, hdr, tickets):
             if not section_in_file(start, end, record['size']):
                 if fs[2:4] == b'\x01\x02':
                     skipped.append(describe_section(
-                        record['name'], offset, record['size'], index, start, end, hdr))
+                        record['name'], record['nca_offset'], record['size'], index, start, end, hdr))
                 continue
             if fs[2:4] != b'\x01\x02':
                 continue
-            line = section_crypto_line(record['name'], index, fs, ticket)
-            require(hashlib.sha256(fs).digest() == hdr[0x280 + 32 * index:0x2A0 + 32 * index],
-                    f'{line} FS header hash mismatch')
-            crypt = fs[4]
-            indirect_size = struct.unpack_from('<Q', fs, 0x108)[0]
-            ex_size = struct.unpack_from('<Q', fs, 0x128)[0]
-            if crypt == 0:
-                crypt = 3
-            elif crypt in (4, 6):
-                if indirect_size or ex_size:
-                    _fail(f'{line} bktr_indirect_size {indirect_size} bktr_ex_size {ex_size}')
-                crypt = 5 if crypt == 6 else 3
-            if crypt not in (1, 2, 3, 5):
-                _fail(line)
-            blocksize, levels = struct.unpack_from('<II', fs, 0x28)
-            hashoff, hashsize, pfsoff, pfssize = struct.unpack_from('<QQQQ', fs, 0x30)
-            secstart, secsize = start * 512, (end - start) * 512
-            require(levels == 2 and blocksize > 0 and pfssize <= 512 * 1024 * 1024,
-                    f'{line} Unsupported ExeFS hash layout')
-            key = None
-            if crypt == 2:
-                key = xts_key(hdr, keys, line)
-            elif crypt in (3, 5):
-                key = content_key(hdr, keys, ticket, line)
-
-            def section_read(relative, size, crypt=crypt, key=key, secstart=secstart, secsize=secsize):
-                require(0 <= relative and relative + size <= secsize, f'{line} Section read out of bounds')
-                absolute = secstart + relative
-
-                def raw_at(origin, length):
-                    return read_at(handle, offset + origin, length)
-
-                def read_ctr(origin, length):
-                    aligned = origin & ~15
-                    iv = fs[0x140:0x148][::-1] + (aligned // 16).to_bytes(8, 'big')
-                    data = raw_at(aligned, length + origin - aligned)
-                    return decrypt(key, modes.CTR(iv), data)[origin - aligned:]
-
-                def read_xts(origin, length):
-                    start_sector = origin & ~511
-                    end = (origin + length + 511) & ~511
-                    blob = raw_at(secstart + start_sector, end - start_sector)
-                    plain = b''.join(
-                        decrypt(key, modes.XTS(((start_sector // 512) + sector).to_bytes(16, 'big')),
-                                blob[sector * 512:(sector + 1) * 512])
-                        for sector in range((end - start_sector) // 512))
-                    return plain[origin - start_sector:origin - start_sector + length]
-
-                if crypt == 1:
-                    return raw_at(absolute, size)
-                if crypt == 2:
-                    return read_xts(relative, size)
-                if crypt != 5 or relative >= pfsoff:
-                    return read_ctr(absolute, size)
-                if relative + size <= pfsoff:
-                    return raw_at(absolute, size)
-                head = pfsoff - relative
-                return raw_at(absolute, head) + read_ctr(absolute + head, size - head)
-
-            hashes = section_read(hashoff, hashsize)
-            require(hashlib.sha256(hashes).digest() == fs[8:40], f'{line} ExeFS hash-table mismatch')
-            pfs = section_read(pfsoff, pfssize)
-            for block, pos in enumerate(range(0, pfssize, blocksize)):
-                expected = hashes[block * 32:(block + 1) * 32]
-                require(hashlib.sha256(pfs[pos:pos + blocksize]).digest() == expected,
-                        f'{line} ExeFS block hash mismatch: {block}')
-            try:
-                members = partition_entries(io.BytesIO(pfs), 0, len(pfs))
-            except ValueError as error:
-                _fail(f'{line} {error}')
-            files = [(member, pfs[off:off + size]) for member, off, size in members]
+            files = read_section_pfs(handle, keys, record, hdr, tickets, index, start, end)
             if any(member == 'main.npdm' for member, _payload in files):
                 return files
     if skipped:
         _fail('no in-range ExeFS; ' + '; '.join(skipped))
     _fail('No ExeFS section found')
+
+
+def sections_past_end(records):
+    """Every section whose media end is past its NCA. Checked before any section body is read."""
+    notes = []
+    for record, header in records:
+        for index, start, end in section_rows(header):
+            if start < end and end * 512 > record['size']:
+                notes.append(
+                    f"section_end: {record['name']} section {index} "
+                    f"byte_end {end * 512} nca_size {record['size']}"
+                )
+    return notes
+
+
+def program_shortfall(record, header):
+    """Program NCA whose ExeFS media end is past nca_size. Returns (verdict, header hash lines)."""
+    overflows = []
+    in_range_exefs = False
+    for index, start, end in section_rows(header):
+        fs = header[0x400 + 512 * index:0x600 + 512 * index]
+        exefs_shaped = fs[2:4] == b'\x01\x02'
+        if section_in_file(start, end, record['size']) and exefs_shaped:
+            in_range_exefs = True
+        if start < end and end * 512 > record['size']:
+            overflows.append((index, start, end, exefs_shaped))
+    if in_range_exefs or not any(shaped for _index, _start, _end, shaped in overflows):
+        return None, []
+    expected = max(end * 512 for _index, _start, end, _shaped in overflows)
+    detail = '; '.join(
+        describe_section(
+            record['name'], record['nca_offset'], record['size'], index, start, end, header)
+        for index, start, end, shaped in overflows if shaped)
+    header_lines = []
+    for index, _start, _end, shaped in overflows:
+        if not shaped:
+            continue
+        fs = header[0x400 + 512 * index:0x600 + 512 * index]
+        listed = header[0x280 + 32 * index:0x2A0 + 32 * index]
+        header_lines.append(
+            f"section_header: {record['name']} section {index} "
+            f"listed_sha256={listed.hex()} actual_sha256={hashlib.sha256(fs).hexdigest()}"
+        )
+    return f'file appears truncated: expected >= {expected} bytes; {detail}', header_lines
+
+
+def nca_content_id(name):
+    lower = name.lower()
+    for suffix in ('.cnmt.nca', '.nca'):
+        if lower.endswith(suffix):
+            token = lower[:-len(suffix)]
+            if len(token) == 32 and all(char in '0123456789abcdef' for char in token):
+                return token
+    return None
+
+
+def range_sha256(path, offset, length):
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        handle.seek(offset)
+        remaining = length
+        while remaining:
+            chunk = handle.read(min(8 << 20, remaining))
+            if not chunk:
+                return None
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def packaged_contents(blob):
+    """Content rows plus the trailing CNMT digest, or (rows, None, None) when the digest is absent.
+
+    Firmware 15.0.0 stores a 5-byte size and one content-attribute byte. A zero attribute
+    byte matches the older 6-byte size. No content row is large enough for that byte to be a size bit.
+    """
+    if len(blob) > 1024 * 1024:
+        _fail(f'cnmt member is {len(blob)} bytes')
+    if len(blob) < 0x20:
+        _fail(f'cnmt header is {len(blob)} bytes')
+    extended, content_count, meta_count = struct.unpack_from('<HHH', blob, 0x0E)
+    if extended > 0x100 or content_count > 64 or meta_count > 64:
+        _fail(f'cnmt extended {extended} content_count {content_count} meta_count {meta_count}')
+    table = 0x20 + extended
+    need = table + content_count * 0x38
+    if len(blob) < need:
+        _fail(f'cnmt table needs {need} bytes and has {len(blob)}')
+    rows = []
+    for index in range(content_count):
+        rec = blob[table + index * 0x38:table + (index + 1) * 0x38]
+        raw_size = rec[0x30:0x36]
+        listed_size = int.from_bytes(raw_size[:5], 'little') if raw_size[5] else int.from_bytes(raw_size, 'little')
+        rows.append({
+            'content_id': rec[0x20:0x30].hex(),
+            'content_type': rec[0x36],
+            'listed_size': listed_size,
+            'listed_sha256': rec[:0x20].hex(),
+        })
+    if len(blob) < need + 0x20:
+        return rows, None, None
+    return rows, blob[-0x20:], hashlib.sha256(blob[:-0x20]).digest()
+
+
+def cnmt_lines(nsp, keys, records, tickets):
+    """Listed content size and SHA-256 against the NCA bytes in the NSP. Sizes and hashes only."""
+    metas = [(record, header) for record, header in records if record['content_type'] == 1]
+    if not metas:
+        return []
+    lines = []
+    rows = []
+    with nsp.open('rb') as handle:
+        for record, header in metas:
+            saw = False
+            found = False
+            opened = False
+            for index, start, end in section_rows(header):
+                saw = True
+                if not section_in_file(start, end, record['size']):
+                    lines.append(
+                        f"cnmt: {record['name']} section {index} "
+                        f"byte_end {end * 512} nca_size {record['size']}"
+                    )
+                    continue
+                fs = header[0x400 + 512 * index:0x600 + 512 * index]
+                if fs[2:4] != b'\x01\x02':
+                    lines.append(
+                        f"cnmt: {record['name']} section {index} fs_type {fs[2]} "
+                        f"hash_type {fs[3]} encryption_type {fs[4]} nca_size {record['size']}"
+                    )
+                    continue
+                try:
+                    files = read_section_pfs(handle, keys, record, header, tickets, index, start, end)
+                except (ProbeError, ValueError) as error:
+                    lines.append(f"cnmt: {record['name']} section {index} {error}")
+                    continue
+                opened = True
+                blobs = [data for name, data in files if name.lower().endswith('.cnmt')]
+                if not blobs:
+                    continue
+                found = True
+                for blob in blobs:
+                    try:
+                        parsed, listed, actual = packaged_contents(blob)
+                    except ProbeError as error:
+                        lines.append(f"cnmt: {record['name']} {error}")
+                        continue
+                    listed_hex = 'absent' if listed is None else listed.hex()
+                    actual_hex = 'absent' if actual is None else actual.hex()
+                    lines.append(
+                        f'cnmt_digest: {record["name"]} listed_sha256={listed_hex} actual_sha256={actual_hex}'
+                    )
+                    rows.extend(parsed)
+            if not saw:
+                lines.append(f"cnmt: {record['name']} has no section nca_size {record['size']}")
+            elif opened and not found:
+                lines.append(f"cnmt: {record['name']} has no cnmt member nca_size {record['size']}")
+    by_id = {}
+    for record, _header in records:
+        content_id = nca_content_id(record['name'])
+        if content_id:
+            by_id.setdefault(content_id, []).append(record)
+    for item in rows:
+        matches = by_id.get(item['content_id'], [])
+        if len(matches) == 1:
+            actual_size = matches[0]['size']
+            actual_hash = range_sha256(nsp, matches[0]['nca_offset'], matches[0]['size']) or 'short'
+        elif matches:
+            actual_size = 'conflict'
+            actual_hash = 'absent'
+        else:
+            actual_size = 'absent'
+            actual_hash = 'absent'
+        lines.append(
+            f"cnmt: {item['content_id']} content_type={item['content_type']} "
+            f"listed_size={item['listed_size']} actual_size={actual_size} "
+            f"listed_sha256={item['listed_sha256']} actual_sha256={actual_hash}"
+        )
+    return lines
 
 
 def format_report(nsp_digest, expected_sha256, members, records, skipped):
@@ -423,6 +607,10 @@ def probe(nsp, keys_path, build, expected_sha256=None):
             with nsp.open('rb') as handle:
                 tickets = read_tickets(handle, entries)
             record, hdr = program_record(records)
+            verdict, header_lines = program_shortfall(record, hdr)
+            if verdict:
+                extra = sections_past_end(records) + header_lines + cnmt_lines(nsp, keys, records, tickets)
+                _fail(verdict, nca_lines(records) + extra)
             files = exefs_members(nsp, keys, record, hdr, tickets)
         except Exception as error:
             inventory = error.inventory if isinstance(error, ProbeError) and error.inventory else nca_lines(records)
