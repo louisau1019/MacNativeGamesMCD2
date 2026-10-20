@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO / 'games' / 'totk' / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from extract_exefs import (  # noqa: E402
-    common_tickets, container_entries, load_keys, nca_ctr_key, nca_inventory,
+    common_tickets, container_entries, load_keys, nca_ctr_key,
     partition_entries, read_at, require,
 )
 from extract_exefs import decrypt  # noqa: E402
@@ -65,6 +65,76 @@ def inside_build(build, path):
     return resolved == root or root in resolved.parents
 
 
+def decrypt_nca_header(handle, name, offset, size, keys):
+    if size < 0xC00:
+        _fail(f'{name} truncated header: nca_offset {offset} nca_size {size}')
+    if 'header_key' not in keys:
+        _fail('Missing header_key in prod.keys')
+    raw = read_at(handle, offset, 0xC00)
+    header = b''.join(
+        decrypt(keys['header_key'], modes.XTS(sector.to_bytes(16, 'big')), raw[sector * 512:(sector + 1) * 512])
+        for sector in range(6))
+    if header[0x200:0x204] != b'NCA3':
+        _fail(f'{name} is not NCA3 at nca_offset {offset} nca_size {size}')
+    content_size = struct.unpack_from('<Q', header, 0x208)[0]
+    if content_size != size:
+        _fail(
+            f'{name} content_size {content_size} != nca_size {size} at nca_offset {offset}')
+    return header
+
+
+def section_rows(header):
+    rows = []
+    for index in range(4):
+        start, end = struct.unpack_from('<II', header, 0x240 + 16 * index)
+        if start == 0 and end == 0:
+            continue
+        rows.append((index, start, end))
+    return rows
+
+
+def section_in_file(start, end, size):
+    if start == 0 or start >= end:
+        return False
+    byte_start = start * 512
+    byte_end = end * 512
+    return 0xC00 <= byte_start < byte_end <= size
+
+
+def describe_section(name, offset, size, index, start, end, header):
+    fs = header[0x400 + 512 * index:0x400 + 512 * index + 5]
+    return (
+        f'{name} section {index} media_start {start} media_end {end} '
+        f'byte_start {start * 512} byte_end {end * 512} '
+        f'nca_offset {offset} nca_size {size} '
+        f'fstype {fs[2]} hashtype {fs[3]} crypt {fs[4]}'
+    )
+
+
+def nca_records(handle, entries, keys):
+    records = []
+    for name, offset, length in entries:
+        if not name.lower().endswith('.nca'):
+            continue
+        header = decrypt_nca_header(handle, name, offset, length, keys)
+        record = dict(
+            name=name, nca_offset=offset, size=length, content_type=header[0x205],
+            title_id=f'{struct.unpack_from("<Q", header, 0x210)[0]:016X}')
+        records.append((record, header))
+    return records
+
+
+def skipped_sections(records):
+    notes = []
+    for record, header in records:
+        for index, start, end in section_rows(header):
+            if section_in_file(start, end, record['size']):
+                continue
+            notes.append(describe_section(
+                record['name'], record['nca_offset'], record['size'], index, start, end, header))
+    return notes
+
+
 def program_record(records):
     programs = [(record, hdr) for record, hdr in records if record['content_type'] == 0]
     if len(programs) != 1:
@@ -79,15 +149,18 @@ def program_record(records):
 
 
 def exefs_members(game, keys, record, hdr, tickets):
-    """Same ExeFS section walk as extract_exefs.main, for TITLE_ID, returning bytes."""
+    """ExeFS walk for the program NCA. Sections that do not fit in the file are skipped."""
     ctr_key = nca_ctr_key(hdr, keys, tickets)
     offset = record['nca_offset']
+    skipped = []
     with game.open('rb') as handle:
-        for index in range(4):
-            start, end = struct.unpack_from('<II', hdr, 0x240 + 16 * index)
-            if not start:
-                continue
+        for index, start, end in section_rows(hdr):
             fs = hdr[0x400 + 512 * index:0x600 + 512 * index]
+            if not section_in_file(start, end, record['size']):
+                if fs[2:4] == b'\x01\x02':
+                    skipped.append(describe_section(
+                        record['name'], offset, record['size'], index, start, end, hdr))
+                continue
             require(hashlib.sha256(fs).digest() == hdr[0x280 + 32 * index:0x2A0 + 32 * index],
                     'FS header hash mismatch')
             if fs[2:4] != b'\x01\x02':
@@ -116,12 +189,14 @@ def exefs_members(game, keys, record, hdr, tickets):
                         f'ExeFS block hash mismatch: {block}')
             files = [(member, pfs[off:off + size]) for member, off, size in
                      partition_entries(io.BytesIO(pfs), 0, len(pfs))]
-            require(any(member == 'main.npdm' for member, _payload in files), 'PFS0 is not ExeFS')
-            return files
+            if any(member == 'main.npdm' for member, _payload in files):
+                return files
+    if skipped:
+        _fail('no in-range ExeFS; ' + '; '.join(skipped))
     _fail('No ExeFS section found')
 
 
-def format_report(nsp_digest, expected_sha256, members):
+def format_report(nsp_digest, expected_sha256, members, records, skipped):
     lines = [
         'status: ok',
         f'nsp_sha256: {nsp_digest}',
@@ -129,6 +204,13 @@ def format_report(nsp_digest, expected_sha256, members):
         f'title_id: {TITLE_ID}',
         f'modules: {sum(1 for item in members if item.get("segments"))}',
     ]
+    for record, _header in records:
+        lines.append(
+            f"nca: {record['name']} content_type={record['content_type']} "
+            f"title_id={record['title_id']} size={record['size']} offset={record['nca_offset']}"
+        )
+    for note in skipped:
+        lines.append(f'section_skipped: {note}')
     for item in members:
         lines.append(f"module: {item['module']}")
         lines.append(f"file_size: {item['file_size']}")
@@ -187,9 +269,10 @@ def probe(nsp, keys_path, build, expected_sha256=None):
             _fail(f'{kind} is not the pinned NSP container')
         with nsp.open('rb') as handle:
             tickets = common_tickets(handle, entries)
-            records = nca_inventory(handle, entries, keys)
+            records = nca_records(handle, entries, keys)
         record, hdr = program_record(records)
         files = exefs_members(nsp, keys, record, hdr, tickets)
+        skipped = skipped_sections(records)
         reports = []
         for name, data in files:
             destination = staging / name
@@ -218,7 +301,7 @@ def probe(nsp, keys_path, build, expected_sha256=None):
         shutil.rmtree(staging, ignore_errors=True)
         shutil.rmtree(meta_dir, ignore_errors=True)
         raise
-    return format_report(digest, expected_sha256, reports)
+    return format_report(digest, expected_sha256, reports, records, skipped)
 
 
 def main(argv):

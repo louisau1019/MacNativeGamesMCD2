@@ -1,5 +1,6 @@
 """Synthetic NSP and NSO fixtures for the Minecraft Dungeons 2 probe. No game bytes."""
 import hashlib
+import io
 import json
 import struct
 import subprocess
@@ -113,7 +114,7 @@ def nso_file(compress_text=False):
     return header + stored + ro + data
 
 
-def _nca(program):
+def _nca(program, content=0, rights=None, past_end_section=False):
     pfs = _partition([('main', program), ('main.npdm', b'META' + bytes(12))])
     block = 4096
     hashes = b''.join(hashlib.sha256(pfs[i:i + block]).digest() for i in range(0, len(pfs), block))
@@ -128,12 +129,18 @@ def _nca(program):
     media = bytes(section).ljust((len(section) + 511) // 512 * 512, b'\0')
     hdr = bytearray(0xC00)
     hdr[0x200:0x204] = b'NCA3'
-    hdr[0x205] = 0
+    hdr[0x205] = content
     hdr[0x206] = 1
     struct.pack_into('<Q', hdr, 0x210, TITLE)
-    hdr[0x300:0x340] = _encrypt(AREA, modes.ECB(), bytes(32) + CONTENT + bytes(16))
+    if rights is None:
+        hdr[0x300:0x340] = _encrypt(AREA, modes.ECB(), bytes(32) + CONTENT + bytes(16))
+    else:
+        hdr[0x230:0x240] = rights
     start = 0xC00
     struct.pack_into('<II', hdr, 0x240, start // 512, (start + len(media)) // 512)
+    if past_end_section:
+        sectors = (0xC00 + len(media) + 511) // 512
+        struct.pack_into('<II', hdr, 0x250, sectors + 1, sectors + 8)
     hdr[0x400:0x600] = fs
     hdr[0x280:0x2A0] = hashlib.sha256(fs).digest()
     body = _encrypt(CONTENT, modes.CTR(bytes(8) + (start // 16).to_bytes(8, 'big')), media)
@@ -145,6 +152,51 @@ def _nca(program):
 
 def nsp_bytes(compress_text=False):
     return _partition([('program.nca', _nca(nso_file(compress_text)))])
+
+
+TITLEKEK = bytes(range(48, 64))
+RIGHTS = TITLE.to_bytes(8, 'little') + bytes(8)
+
+
+def _ticket():
+    data = bytearray(704)
+    struct.pack_into('<I', data, 0, 0x10004)
+    data[0x180:0x190] = _encrypt(TITLEKEK, modes.ECB(), CONTENT)
+    data[0x2A0:0x2B0] = RIGHTS
+    return bytes(data)
+
+
+def _shell_nca(content, media_start, media_end, pfs=False):
+    header = bytearray(0xC00)
+    header[0x200:0x204] = b'NCA3'
+    header[0x205] = content
+    header[0x206] = 1
+    struct.pack_into('<Q', header, 0x210, TITLE)
+    header[0x300:0x340] = _encrypt(AREA, modes.ECB(), bytes(32) + CONTENT + bytes(16))
+    struct.pack_into('<II', header, 0x240, media_start, media_end)
+    if pfs:
+        header[0x402:0x405] = bytes((1, 2, 3))
+    struct.pack_into('<Q', header, 0x208, len(header))
+    return b''.join(
+        _encrypt(HEADER, modes.XTS(i.to_bytes(16, 'big')), header[i * 512:(i + 1) * 512])
+        for i in range(6))
+
+
+def retail_layout_nsp():
+    """Cert, common ticket, an NCA whose section ends past the file, then the program.
+
+    File sizes follow the reported PFS0 shape: the first NCA is not 512-byte aligned,
+    and a later NCA follows an odd-sized XML file. No game bytes.
+    """
+    program = _nca(nso_file(), rights=RIGHTS, past_end_section=True)
+    return _partition([
+        ('0100a7c01b7920000000000000000016.cert', b'C' * 1792),
+        ('0100a7c01b7920000000000000000016.tik', _ticket()),
+        ('control.nca', _shell_nca(2, 6, 8)),
+        ('meta.cnmt.nca', _shell_nca(1, 0, 0)),
+        ('meta.cnmt.xml', b'x' * 1666),
+        ('program.nca', program),
+    ])
 
 
 class Probe(unittest.TestCase):
@@ -246,6 +298,71 @@ class Probe(unittest.TestCase):
             meta = json.loads((build / 'meta' / 'main.json').read_text())
             self.assertNotIn(MARKER.decode(), json.dumps(meta))
             self.assertEqual((build / 'exefs' / 'main').read_bytes()[:4], b'NSO0')
+
+    def test_unaligned_ticket_nsp_skips_a_section_past_the_file(self):
+        payload = retail_layout_nsp()
+        _kind, entries = probe_metadata.container_entries(io.BytesIO(payload), len(payload))
+        located = {name: (offset, size) for name, offset, size in entries}
+        data_start = min(offset for offset, _size in located.values())
+        control_off, _control_size = located['control.nca']
+        program_off, _program_size = located['program.nca']
+        self.assertNotEqual((control_off - data_start) % 512, 0)
+        self.assertNotEqual(program_off % 512, 0)
+        self.assertIn('0100a7c01b7920000000000000000016.tik', located)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nsp = root / 'game.nsp'
+            keys = root / 'prod.keys'
+            build = root / 'MCD2_build'
+            nsp.write_bytes(payload)
+            keys.write_text('\n'.join(f'{name} = {value.hex()}' for name, value in (
+                ('header_key', HEADER),
+                ('key_area_key_application_00', AREA),
+                ('titlekek_00', TITLEKEK),
+            )))
+            text = probe_metadata.probe(
+                nsp, keys, build, expected_sha256=hashlib.sha256(payload).hexdigest())
+            self.assertIn('status: ok', text)
+            self.assertIn(f'title_id: {TITLE:016X}', text)
+            self.assertIn('nca: control.nca content_type=2', text)
+            self.assertIn('nca: program.nca content_type=0', text)
+            self.assertIn('section_skipped: control.nca section 0 media_start 6 media_end 8 byte_start 3072 byte_end 4096', text)
+            self.assertIn('section_skipped: program.nca section 1', text)
+            self.assertIn('import: _import_missing', text)
+            self.assertIn('export: nnMain', text)
+            self.assertNotIn(MARKER.decode(), text)
+            self.assertNotIn(DIALOGUE.decode(), text)
+            self.assertNotIn(HEADER.hex(), text)
+            self.assertNotIn(CONTENT.hex(), text)
+            self.assertNotIn(TITLEKEK.hex(), text)
+            written = sorted(path.relative_to(build).as_posix() for path in build.rglob('*') if path.is_file())
+            self.assertEqual(written, ['exefs/main', 'exefs/main.npdm', 'meta/main.json'])
+
+    def test_exefs_section_past_the_file_names_offsets_and_writes_nothing(self):
+        program = _shell_nca(0, 6, 8, pfs=True)
+        payload = _partition([('program.nca', program)])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nsp = root / 'game.nsp'
+            keys = root / 'prod.keys'
+            build = root / 'MCD2_build'
+            nsp.write_bytes(payload)
+            keys.write_text(f'header_key = {HEADER.hex()}\nkey_area_key_application_00 = {AREA.hex()}\n')
+            with self.assertRaises(probe_metadata.ProbeError) as caught:
+                probe_metadata.probe(
+                    nsp, keys, build, expected_sha256=hashlib.sha256(payload).hexdigest())
+            message = str(caught.exception)
+            self.assertIn('program.nca section 0', message)
+            self.assertIn('media_start 6', message)
+            self.assertIn('media_end 8', message)
+            self.assertIn('byte_start 3072', message)
+            self.assertIn('byte_end 4096', message)
+            self.assertIn('nca_size 3072', message)
+            self.assertIn('nca_offset ', message)
+            self.assertNotIn(MARKER.decode(), message)
+            self.assertNotIn(HEADER.hex(), message)
+            self.assertNotIn(CONTENT.hex(), message)
+            self.assertEqual([path for path in build.rglob('*') if path.is_file()], [])
 
 
 if __name__ == '__main__':

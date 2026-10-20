@@ -18,7 +18,9 @@ python3 games/mcd2/scripts/probe_metadata.py \
 
 `--build-dir` must be outside the git checkout. Decrypted modules are written only there.
 
-Success is exit 0 and stdout that starts with `status: ok`, then `nsp_sha256` equal to `expected_nsp_sha256`, `title_id: 0100A7C01B792000`, and one `module:` block per ExeFS member. NSO blocks include `build_id`, `sdk_version`, `segment:` lines, `import:`, `export:`, and `service:`. A hash mismatch exits 2, prints both hashes, and writes nothing.
+Success is exit 0 and stdout that starts with `status: ok`, then `nsp_sha256` equal to `expected_nsp_sha256`, `title_id: 0100A7C01B792000`, one `nca:` line per NCA, and one `module:` block per ExeFS member. NSO blocks include `build_id`, `sdk_version`, `segment:` lines, `import:`, `export:`, and `service:`. A `section_skipped:` line means that section's media range does not fit in the NCA file, so the probe did not read it. ExeFS is still read when its own range fits. A hash mismatch exits 2, prints both hashes, and writes nothing.
+
+If the ExeFS section itself does not fit, the probe exits 2 and the message names the NCA, the section index, `media_start`, `media_end`, `byte_start`, `byte_end`, `nca_offset`, and `nca_size`. It does not print key material or file bytes. A common ticket in the NSP is decrypted with `titlekek_XX` from `prod.keys`. This probe does not read `title.keys`.
 
 `sdk_version: absent` means the rodata string `sdk_version:` was not found. That is a report, not a failed probe.
 
