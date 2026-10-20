@@ -366,17 +366,18 @@ def sections_past_end(records):
 
 
 def program_shortfall(record, header):
-    """Program NCA whose ExeFS media end is past nca_size. Returns (verdict, header hash lines)."""
+    """Program NCA with an ExeFS-shaped section past nca_size.
+
+    An in-range PartitionFS section, such as a logo, does not contain the code.
+    It must not hide a code section whose end is past the file.
+    """
     overflows = []
-    in_range_exefs = False
     for index, start, end in section_rows(header):
         fs = header[0x400 + 512 * index:0x600 + 512 * index]
         exefs_shaped = fs[2:4] == b'\x01\x02'
-        if section_in_file(start, end, record['size']) and exefs_shaped:
-            in_range_exefs = True
         if start < end and end * 512 > record['size']:
             overflows.append((index, start, end, exefs_shaped))
-    if in_range_exefs or not any(shaped for _index, _start, _end, shaped in overflows):
+    if not any(shaped for _index, _start, _end, shaped in overflows):
         return None, []
     expected = max(end * 512 for _index, _start, end, _shaped in overflows)
     detail = '; '.join(

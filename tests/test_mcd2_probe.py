@@ -202,6 +202,157 @@ def _shell_nca(content, media_start, media_end, pfs=False):
         for i in range(6))
 
 
+def _sha_pfs(files, block=4096):
+    pfs = _partition(files)
+    hashes = b''.join(hashlib.sha256(pfs[i:i + block]).digest() for i in range(0, len(pfs), block))
+    pfsoff = (len(hashes) + 15) & ~15
+    body = bytearray(pfsoff + len(pfs))
+    body[:len(hashes)] = hashes
+    body[pfsoff:pfsoff + len(pfs)] = pfs
+    media = bytes(body).ljust((len(body) + 511) // 512 * 512, b'\0')
+    fs = bytearray(512)
+    fs[2:4] = bytes((1, 2))
+    fs[4] = 3
+    fs[8:40] = hashlib.sha256(hashes).digest()
+    struct.pack_into('<IIQQQQ', fs, 0x28, block, 2, 0, len(hashes), pfsoff, len(pfs))
+    return media, bytes(fs)
+
+
+def _encrypt_nca_header(header):
+    return b''.join(
+        _encrypt(HEADER, modes.XTS(i.to_bytes(16, 'big')), bytes(header[i * 512:(i + 1) * 512]))
+        for i in range(6))
+
+
+def _hash_prefixed(prefix, total):
+    digest = hashlib.sha256()
+    digest.update(prefix)
+    remaining = total - len(prefix)
+    chunk = b'\0' * (8 << 20)
+    while remaining:
+        take = chunk if remaining >= len(chunk) else chunk[:remaining]
+        digest.update(take)
+        remaining -= len(take)
+    return digest.digest()
+
+
+def _shell_prefix(content, size):
+    header = bytearray(0xC00)
+    header[0x200:0x204] = b'NCA3'
+    header[0x205] = content
+    header[0x206] = 1
+    struct.pack_into('<Q', header, 0x210, TITLE)
+    header[0x300:0x340] = _encrypt(AREA, modes.ECB(), bytes(32) + CONTENT + bytes(16))
+    struct.pack_into('<Q', header, 0x208, size)
+    return _encrypt_nca_header(header)
+
+
+def _ctr_section(files):
+    media, fs = _sha_pfs(files)
+    start = 0xC00
+    stored = _encrypt(CONTENT, modes.CTR(bytes(8) + (start // 16).to_bytes(8, 'big')), media)
+    return stored, fs, start // 512, (start + len(stored)) // 512
+
+
+def reported_nsp(path):
+    """Sparse NSP with the sizes and offsets from the Mac run, plus an in-range logo PFS0.
+
+    Section 0 of the Program NCA is the reported ExeFS range, which ends past the file.
+    Section 1 is a PartitionFS that fits and has no main.npdm. The old probe treated that
+    logo as proof an ExeFS was present, then aborted with 'no in-range ExeFS'.
+    """
+    program_id = bytes.fromhex('a1cb976a3d212c3f2bc940f9ca153bff')
+    control_id = bytes.fromhex('6a7937b1e1713f271a73dca10739f50d')
+    logo, logo_fs, logo_start, logo_end = _ctr_section([('logo', b'LOGO')])
+    program_size = 1661878272
+    far = bytearray(512)
+    far[2:5] = bytes((1, 2, 3))
+    program = bytearray(0xC00)
+    program[0x200:0x204] = b'NCA3'
+    program[0x206] = 1
+    struct.pack_into('<Q', program, 0x208, program_size)
+    struct.pack_into('<Q', program, 0x210, TITLE)
+    program[0x300:0x340] = _encrypt(AREA, modes.ECB(), bytes(32) + CONTENT + bytes(16))
+    struct.pack_into('<II', program, 0x240, 8024096, 8208160)
+    struct.pack_into('<II', program, 0x250, logo_start, logo_end)
+    program[0x280:0x2A0] = hashlib.sha256(far).digest()
+    program[0x2A0:0x2C0] = hashlib.sha256(logo_fs).digest()
+    program[0x400:0x600] = far
+    program[0x600:0x800] = logo_fs
+    program_prefix = _encrypt_nca_header(program) + logo
+    program_hash = _hash_prefixed(program_prefix, program_size)
+    control_size = 541696
+    control_prefix = _shell_prefix(2, control_size)
+    control_hash = _hash_prefixed(control_prefix, control_size)
+    published = hashlib.sha256(b'published-program').digest()
+    cnmt_header = bytearray(0x20)
+    struct.pack_into('<Q', cnmt_header, 0, TITLE)
+    cnmt_header[0xC] = 0x80
+    extended = bytes(0x10)
+    struct.pack_into('<H', cnmt_header, 0x0E, len(extended))
+    struct.pack_into('<HH', cnmt_header, 0x10, 2, 0)
+    blob = bytes(cnmt_header) + extended
+    for digest, content_id, size, content_type in (
+        (published, program_id, 4202577920, 0),
+        (control_hash, control_id, control_size, 2),
+    ):
+        rec = bytearray(0x38)
+        rec[:0x20] = digest
+        rec[0x20:0x30] = content_id
+        rec[0x30:0x36] = size.to_bytes(6, 'little')
+        rec[0x36] = content_type
+        blob += bytes(rec)
+    cnmt = blob + hashlib.sha256(blob).digest()
+    meta_body, meta_fs, meta_start, meta_end = _ctr_section([(f'Application_{TITLE:016x}.cnmt', cnmt)])
+    meta_size = 3584
+    if 0xC00 + len(meta_body) > meta_size:
+        raise AssertionError(f'meta section is {0xC00 + len(meta_body)} bytes')
+    meta = bytearray(0xC00)
+    meta[0x200:0x204] = b'NCA3'
+    meta[0x205] = 1
+    meta[0x206] = 1
+    struct.pack_into('<Q', meta, 0x208, meta_size)
+    struct.pack_into('<Q', meta, 0x210, TITLE)
+    meta[0x300:0x340] = _encrypt(AREA, modes.ECB(), bytes(32) + CONTENT + bytes(16))
+    struct.pack_into('<II', meta, 0x240, meta_start, meta_end)
+    meta[0x280:0x2A0] = hashlib.sha256(meta_fs).digest()
+    meta[0x400:0x600] = meta_fs
+    meta_prefix = _encrypt_nca_header(meta) + meta_body
+    manual = _shell_prefix(3, 155648)
+    legal = _shell_prefix(3, 16384)
+    files = [
+        ('0100a7c01b7920000000000000000016.cert', 1792, b'C' * 1792),
+        ('0100a7c01b7920000000000000000016.tik', 704, _ticket()),
+        ('4ba1c4cde60bf3d5756a5bbeef5bc37c.nca', 155648, manual),
+        ('5d93dc5bc32c5724a18c498d7c3d9552.cnmt.nca', 3584, meta_prefix),
+        ('5d93dc5bc32c5724a18c498d7c3d9552.cnmt.xml', 1666, b'x' * 1666),
+        ('6a7937b1e1713f271a73dca10739f50d.nca', control_size, control_prefix),
+        ('a1cb976a3d212c3f2bc940f9ca153bff.nca', program_size, program_prefix),
+        ('d934a48b90c733e24497a360cc4d456d.nca', 16384, legal),
+    ]
+    strings = b''.join(name.encode() + b'\0' for name, _size, _prefix in files)
+    strings = strings.ljust(320, b'\0')
+    table = bytearray()
+    data_off = 0
+    for name, size, _prefix in files:
+        table += struct.pack('<QQII', data_off, size, strings.find(name.encode() + b'\0'), 0)
+        data_off += size
+    header = b'PFS0' + struct.pack('<III', len(files), len(strings), 0) + bytes(table) + strings
+    if len(header) != 528:
+        raise AssertionError(f'PFS0 header is {len(header)} bytes')
+    total = len(header) + data_off
+    with path.open('wb') as handle:
+        handle.truncate(total)
+        handle.seek(0)
+        handle.write(header)
+        cursor = len(header)
+        for _name, size, prefix in files:
+            handle.seek(cursor)
+            handle.write(prefix)
+            cursor += size
+    return program_hash, published, control_hash, cnmt
+
+
 def retail_layout_nsp():
     """Cert, common ticket, an NCA whose section ends past the file, then the program.
 
@@ -562,6 +713,69 @@ class Probe(unittest.TestCase):
                 self.assertEqual([path for path in build.rglob('*') if path.is_file()], [])
         finally:
             probe_metadata.NSP_SHA256 = old
+
+    def test_reported_layout_logo_used_to_hide_the_short_program_section(self):
+        old_probe = (
+            'probe: no in-range ExeFS; a1cb976a3d212c3f2bc940f9ca153bff.nca section 0 '
+            'media_start 8024096 media_end 8208160 byte_start 4108337152 byte_end 4202577920 '
+            'nca_offset 705618 nca_size 1661878272 fstype 1 hashtype 2 crypt 3'
+        )
+        nca_lines = [
+            'nca: 4ba1c4cde60bf3d5756a5bbeef5bc37c.nca content_type=3 title_id=0100A7C01B792000 size=155648 offset=3024',
+            'nca: 5d93dc5bc32c5724a18c498d7c3d9552.cnmt.nca content_type=1 title_id=0100A7C01B792000 size=3584 offset=158672',
+            'nca: 6a7937b1e1713f271a73dca10739f50d.nca content_type=2 title_id=0100A7C01B792000 size=541696 offset=163922',
+            'nca: a1cb976a3d212c3f2bc940f9ca153bff.nca content_type=0 title_id=0100A7C01B792000 size=1661878272 offset=705618',
+            'nca: d934a48b90c733e24497a360cc4d456d.nca content_type=3 title_id=0100A7C01B792000 size=16384 offset=1662583890',
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nsp = root / 'game.nsp'
+            program_hash, published, control_hash, cnmt = reported_nsp(nsp)
+            digest = hashlib.sha256()
+            with nsp.open('rb') as handle:
+                while chunk := handle.read(8 << 20):
+                    digest.update(chunk)
+            digest = digest.hexdigest()
+            keys = root / 'prod.keys'
+            build = root / 'MCD2_build'
+            keys.write_text(self._keys())
+            old = probe_metadata.NSP_SHA256
+            probe_metadata.NSP_SHA256 = digest
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    status = probe_metadata.main([
+                        '--nsp', str(nsp), '--keys', str(keys), '--build-dir', str(build)])
+                text = err.getvalue()
+                self.assertEqual(status, 2, text)
+                lines = text.splitlines()
+                self.assertEqual(lines[:5], nca_lines)
+                self.assertLess(text.index('nca:'), text.index('section_end:'))
+                self.assertLess(text.index('section_end:'), text.index('section_header:'))
+                self.assertLess(text.index('section_header:'), text.index('cnmt:'))
+                self.assertLess(text.index('cnmt:'), text.index('probe:'))
+                self.assertNotIn('no in-range ExeFS', text)
+                self.assertIn('file appears truncated: expected >= 4202577920 bytes', text)
+                self.assertIn(old_probe.split('no in-range ExeFS; ', 1)[1], text)
+                self.assertIn(
+                    'cnmt: a1cb976a3d212c3f2bc940f9ca153bff content_type=0 '
+                    f'listed_size=4202577920 actual_size=1661878272 '
+                    f'listed_sha256={published.hex()} actual_sha256={program_hash.hex()}',
+                    text)
+                self.assertIn(
+                    'cnmt: 6a7937b1e1713f271a73dca10739f50d content_type=2 '
+                    f'listed_size=541696 actual_size=541696 '
+                    f'listed_sha256={control_hash.hex()} actual_sha256={control_hash.hex()}',
+                    text)
+                self.assertNotIn(MARKER.decode(), text)
+                self.assertNotIn(b'LOGO'.decode(), text)
+                self.assertNotIn(HEADER.hex(), text)
+                self.assertNotIn(CONTENT.hex(), text)
+                self.assertNotIn(TITLEKEK.hex(), text)
+                self.assertNotIn(cnmt.hex(), text)
+                self.assertEqual([path for path in build.rglob('*') if path.is_file()], [])
+            finally:
+                probe_metadata.NSP_SHA256 = old
 
 
 if __name__ == '__main__':
