@@ -201,7 +201,7 @@ class Probe(unittest.TestCase):
             nsp.write_bytes(nsp_bytes())
             keys.write_text('\n'.join(f'{name} = {value.hex()}' for name, value in (
                 ('header_key', HEADER), ('key_area_key_application_00', AREA))))
-            inside = ROOT / 'games' / 'mcd2' / 'build'
+            inside = ROOT / 'games' / 'mcd2' / 'probe-out'
             result = subprocess.run(
                 [sys.executable, str(ROOT / 'games/mcd2/scripts/probe_metadata.py'),
                  '--nsp', str(nsp), '--keys', str(keys), '--build-dir', str(inside)],
@@ -209,6 +209,14 @@ class Probe(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn('outside this repository', result.stderr)
             self.assertFalse(inside.exists())
+            host = ROOT / 'games' / 'mcd2' / 'build'
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'games/mcd2/scripts/probe_metadata.py'),
+                 '--nsp', str(nsp), '--keys', str(keys), '--build-dir', str(host)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertFalse((host / 'exefs').exists())
+            self.assertFalse((host / 'meta').exists())
 
     def test_probe_writes_only_under_the_build_dir_and_prints_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
