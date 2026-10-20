@@ -1,4 +1,5 @@
 """Synthetic NSP and NSO fixtures for the Minecraft Dungeons 2 probe. No game bytes."""
+import contextlib
 import hashlib
 import io
 import json
@@ -114,7 +115,7 @@ def nso_file(compress_text=False):
     return header + stored + ro + data
 
 
-def _nca(program, content=0, rights=None, past_end_section=False):
+def _nca(program, content=0, rights=None, past_end_section=False, encryption=3, body='ctr', indirect_size=0):
     pfs = _partition([('main', program), ('main.npdm', b'META' + bytes(12))])
     block = 4096
     hashes = b''.join(hashlib.sha256(pfs[i:i + block]).digest() for i in range(0, len(pfs), block))
@@ -123,9 +124,11 @@ def _nca(program, content=0, rights=None, past_end_section=False):
     section[:len(hashes)] = hashes
     section[pfsoff:pfsoff + len(pfs)] = pfs
     fs = bytearray(512)
-    fs[2:5] = bytes([1, 2, 3])
+    fs[2:4] = bytes((1, 2))
+    fs[4] = encryption
     fs[8:40] = hashlib.sha256(hashes).digest()
     struct.pack_into('<IIQQQQ', fs, 0x28, block, 2, 0, len(hashes), pfsoff, len(pfs))
+    struct.pack_into('<Q', fs, 0x108, indirect_size)
     media = bytes(section).ljust((len(section) + 511) // 512 * 512, b'\0')
     hdr = bytearray(0xC00)
     hdr[0x200:0x204] = b'NCA3'
@@ -133,7 +136,8 @@ def _nca(program, content=0, rights=None, past_end_section=False):
     hdr[0x206] = 1
     struct.pack_into('<Q', hdr, 0x210, TITLE)
     if rights is None:
-        hdr[0x300:0x340] = _encrypt(AREA, modes.ECB(), bytes(32) + CONTENT + bytes(16))
+        key_head = bytes(range(32)) if body == 'xts' else bytes(32)
+        hdr[0x300:0x340] = _encrypt(AREA, modes.ECB(), key_head + CONTENT + bytes(16))
     else:
         hdr[0x230:0x240] = rights
     start = 0xC00
@@ -143,11 +147,22 @@ def _nca(program, content=0, rights=None, past_end_section=False):
         struct.pack_into('<II', hdr, 0x250, sectors + 1, sectors + 8)
     hdr[0x400:0x600] = fs
     hdr[0x280:0x2A0] = hashlib.sha256(fs).digest()
-    body = _encrypt(CONTENT, modes.CTR(bytes(8) + (start // 16).to_bytes(8, 'big')), media)
-    struct.pack_into('<Q', hdr, 0x208, len(hdr) + len(body))
+    if body == 'plain':
+        stored = media
+    elif body == 'xts':
+        stored = b''.join(
+            _encrypt(bytes(range(32)), modes.XTS(sector.to_bytes(16, 'big')), media[sector * 512:(sector + 1) * 512])
+            for sector in range(len(media) // 512))
+    elif body == 'skip':
+        stored = bytearray(_encrypt(CONTENT, modes.CTR(bytes(8) + (start // 16).to_bytes(8, 'big')), media))
+        stored[:pfsoff] = media[:pfsoff]
+        stored = bytes(stored)
+    else:
+        stored = _encrypt(CONTENT, modes.CTR(bytes(8) + (start // 16).to_bytes(8, 'big')), media)
+    struct.pack_into('<Q', hdr, 0x208, len(hdr) + len(stored))
     encrypted = b''.join(
         _encrypt(HEADER, modes.XTS(i.to_bytes(16, 'big')), hdr[i * 512:(i + 1) * 512]) for i in range(6))
-    return encrypted + body
+    return encrypted + stored
 
 
 def nsp_bytes(compress_text=False):
@@ -158,10 +173,12 @@ TITLEKEK = bytes(range(48, 64))
 RIGHTS = TITLE.to_bytes(8, 'little') + bytes(8)
 
 
-def _ticket():
+def _ticket(key_generation=0, personalized=False):
     data = bytearray(704)
     struct.pack_into('<I', data, 0, 0x10004)
     data[0x180:0x190] = _encrypt(TITLEKEK, modes.ECB(), CONTENT)
+    data[0x281] = int(personalized)
+    data[0x285] = key_generation
     data[0x2A0:0x2B0] = RIGHTS
     return bytes(data)
 
@@ -363,6 +380,92 @@ class Probe(unittest.TestCase):
             self.assertNotIn(HEADER.hex(), message)
             self.assertNotIn(CONTENT.hex(), message)
             self.assertEqual([path for path in build.rglob('*') if path.is_file()], [])
+
+    def _keys(self):
+        return '\n'.join(f'{name} = {value.hex()}' for name, value in (
+            ('header_key', HEADER),
+            ('key_area_key_application_00', AREA),
+            ('titlekek_00', TITLEKEK),
+        ))
+
+    def _read(self, payload):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nsp = root / 'game.nsp'
+            keys = root / 'prod.keys'
+            build = root / 'MCD2_build'
+            nsp.write_bytes(payload)
+            keys.write_text(self._keys())
+            return probe_metadata.probe(
+                nsp, keys, build, expected_sha256=hashlib.sha256(payload).hexdigest())
+
+    def test_exefs_accepts_auto_none_xts_and_skip_layer(self):
+        cases = ((0, 'ctr'), (1, 'plain'), (2, 'xts'), (4, 'ctr'), (5, 'skip'), (6, 'skip'))
+        for encryption, body in cases:
+            with self.subTest(encryption=encryption, body=body):
+                payload = _partition([('program.nca', _nca(nso_file(), encryption=encryption, body=body))])
+                text = self._read(payload)
+                self.assertIn('status: ok', text)
+                self.assertIn('export: nnMain', text)
+                self.assertIn('service: fsp-srv', text)
+                self.assertNotIn(MARKER.decode(), text)
+                self.assertNotIn(DIALOGUE.decode(), text)
+                self.assertNotIn(CONTENT.hex(), text)
+                self.assertNotIn(HEADER.hex(), text)
+
+    def test_bktr_exefs_prints_nca_lines_then_the_section_types(self):
+        payload = _partition([
+            ('control.nca', _shell_nca(2, 6, 8)),
+            ('program.nca', _nca(nso_file(), rights=RIGHTS, encryption=4, indirect_size=16)),
+            ('0100a7c01b7920000000000000000016.tik', _ticket(key_generation=9)),
+        ])
+        digest = hashlib.sha256(payload).hexdigest()
+        old = probe_metadata.NSP_SHA256
+        probe_metadata.NSP_SHA256 = digest
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                nsp = root / 'game.nsp'
+                keys = root / 'prod.keys'
+                build = root / 'MCD2_build'
+                nsp.write_bytes(payload)
+                keys.write_text(self._keys())
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    status = probe_metadata.main([
+                        '--nsp', str(nsp), '--keys', str(keys), '--build-dir', str(build)])
+                text = err.getvalue()
+                self.assertEqual(status, 2, text)
+                self.assertLess(text.index('nca: control.nca'), text.index('probe:'))
+                self.assertLess(text.index('nca: program.nca'), text.index('probe:'))
+                self.assertIn(
+                    'program.nca section 0 fs_type 1 hash_type 2 encryption_type 4 '
+                    'ticket_key_generation 9 titlekey_type common',
+                    text)
+                self.assertIn('bktr_indirect_size 16', text)
+                self.assertNotIn(MARKER.decode(), text)
+                self.assertNotIn(CONTENT.hex(), text)
+                self.assertNotIn(TITLEKEK.hex(), text)
+                self.assertNotIn(HEADER.hex(), text)
+                self.assertEqual([path for path in build.rglob('*') if path.is_file()], [])
+        finally:
+            probe_metadata.NSP_SHA256 = old
+
+    def test_personalized_ticket_is_named_and_not_decrypted(self):
+        payload = _partition([
+            ('program.nca', _nca(nso_file(), rights=RIGHTS, encryption=3)),
+            ('game.tik', _ticket(key_generation=4, personalized=True)),
+        ])
+        with self.assertRaises(probe_metadata.ProbeError) as caught:
+            self._read(payload)
+        message = str(caught.exception)
+        self.assertIn('titlekey_type personalized', message)
+        self.assertIn('ticket_key_generation 4', message)
+        self.assertIn('encryption_type 3', message)
+        self.assertTrue(any(line.startswith('nca: program.nca') for line in caught.exception.inventory))
+        self.assertNotIn(CONTENT.hex(), message)
+        self.assertNotIn(TITLEKEK.hex(), message)
+        self.assertNotIn(MARKER.decode(), message)
 
 
 if __name__ == '__main__':

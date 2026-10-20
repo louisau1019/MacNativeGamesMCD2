@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO / 'games' / 'totk' / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from extract_exefs import (  # noqa: E402
-    common_tickets, container_entries, load_keys, nca_ctr_key,
+    container_entries, load_keys, nca_ctr_key,
     partition_entries, read_at, require,
 )
 from extract_exefs import decrypt  # noqa: E402
@@ -35,11 +35,19 @@ NSP_SHA256 = EXPECTED['nsp_sha256']
 
 
 class ProbeError(Exception):
-    pass
+    def __init__(self, message, inventory=()):
+        super().__init__(message)
+        self.inventory = tuple(inventory)
 
 
-def _fail(message):
-    raise ProbeError(message)
+def _fail(message, inventory=()):
+    raise ProbeError(message, inventory)
+
+
+_TICKET_BODIES = {
+    0x10000: 0x240, 0x10001: 0x140, 0x10002: 0x80,
+    0x10003: 0x240, 0x10004: 0x140, 0x10005: 0x80,
+}
 
 
 def file_sha256(path):
@@ -148,10 +156,107 @@ def program_record(records):
     return record, hdr
 
 
+def read_tickets(handle, entries):
+    found = []
+    for _name, offset, size in entries:
+        if not _name.lower().endswith('.tik'):
+            continue
+        if size < 4:
+            _fail('Truncated NSP ticket')
+        signature = struct.unpack('<I', read_at(handle, offset, 4))[0]
+        if signature not in _TICKET_BODIES:
+            _fail('Unsupported NSP ticket signature type')
+        body = _TICKET_BODIES[signature]
+        if size < body + 0x180:
+            _fail('Truncated NSP ticket body')
+        data = read_at(handle, offset + body, 0x180)
+        kind_byte = data[0x141]
+        if kind_byte == 0:
+            kind = 'common'
+        elif kind_byte == 1:
+            kind = 'personalized'
+        else:
+            kind = str(kind_byte)
+        found.append({
+            'rights': data[0x160:0x170],
+            'enc_key': data[0x40:0x50] if kind == 'common' else None,
+            'titlekey_type': kind,
+            'key_generation': data[0x145],
+        })
+    return found
+
+
+def ticket_for(header, tickets):
+    rights = header[0x230:0x240]
+    if rights == bytes(16):
+        return None
+    matches = [item for item in tickets if item['rights'] == rights]
+    if not matches:
+        return None
+    first = matches[0]
+    if any(item['titlekey_type'] != first['titlekey_type'] or item['key_generation'] != first['key_generation']
+           or item['enc_key'] != first['enc_key'] for item in matches[1:]):
+        _fail('Conflicting NSP tickets')
+    return first
+
+
+def ticket_fields(ticket):
+    if ticket is None:
+        return 'ticket_key_generation absent titlekey_type absent'
+    return f"ticket_key_generation {ticket['key_generation']} titlekey_type {ticket['titlekey_type']}"
+
+
+def section_crypto_line(name, index, fs, ticket):
+    return (
+        f'{name} section {index} fs_type {fs[2]} hash_type {fs[3]} '
+        f'encryption_type {fs[4]} {ticket_fields(ticket)}'
+    )
+
+
+def key_area_plain(header, keys):
+    generation = max(max(header[0x206], header[0x220]) - 1, 0)
+    if header[0x207] >= 3:
+        _fail('Unsupported NCA key area')
+    area = ('application', 'ocean', 'system')[header[0x207]]
+    keyname = f'key_area_key_{area}_{generation:02x}'
+    if keyname not in keys:
+        _fail(f'Missing {keyname} in prod.keys')
+    return decrypt(keys[keyname], modes.ECB(), header[0x300:0x340])
+
+
+def content_key(header, keys, ticket, line):
+    rights = header[0x230:0x240]
+    try:
+        if rights != bytes(16):
+            if ticket is None or ticket['titlekey_type'] != 'common':
+                _fail(line)
+            return nca_ctr_key(header, keys, {rights: ticket['enc_key']})
+        return nca_ctr_key(header, keys, {})
+    except ValueError as error:
+        _fail(f'{line} {error}')
+
+
+def xts_key(header, keys, line):
+    if header[0x230:0x240] != bytes(16):
+        _fail(f'{line} aes-xts section uses a rights id')
+    plain = key_area_plain(header, keys)
+    if plain[0:16] == plain[16:32]:
+        _fail(f'{line} aes-xts key halves are equal')
+    return plain[0:32]
+
+
+def nca_lines(records):
+    return [
+        f"nca: {record['name']} content_type={record['content_type']} "
+        f"title_id={record['title_id']} size={record['size']} offset={record['nca_offset']}"
+        for record, _header in records
+    ]
+
+
 def exefs_members(game, keys, record, hdr, tickets):
     """ExeFS walk for the program NCA. Sections that do not fit in the file are skipped."""
-    ctr_key = nca_ctr_key(hdr, keys, tickets)
     offset = record['nca_offset']
+    ticket = ticket_for(hdr, tickets)
     skipped = []
     with game.open('rb') as handle:
         for index, start, end in section_rows(hdr):
@@ -161,34 +266,79 @@ def exefs_members(game, keys, record, hdr, tickets):
                     skipped.append(describe_section(
                         record['name'], offset, record['size'], index, start, end, hdr))
                 continue
-            require(hashlib.sha256(fs).digest() == hdr[0x280 + 32 * index:0x2A0 + 32 * index],
-                    'FS header hash mismatch')
             if fs[2:4] != b'\x01\x02':
                 continue
-            require(fs[4] == 3, 'Only AES-CTR ExeFS is supported')
+            line = section_crypto_line(record['name'], index, fs, ticket)
+            require(hashlib.sha256(fs).digest() == hdr[0x280 + 32 * index:0x2A0 + 32 * index],
+                    f'{line} FS header hash mismatch')
+            crypt = fs[4]
+            indirect_size = struct.unpack_from('<Q', fs, 0x108)[0]
+            ex_size = struct.unpack_from('<Q', fs, 0x128)[0]
+            if crypt == 0:
+                crypt = 3
+            elif crypt in (4, 6):
+                if indirect_size or ex_size:
+                    _fail(f'{line} bktr_indirect_size {indirect_size} bktr_ex_size {ex_size}')
+                crypt = 5 if crypt == 6 else 3
+            if crypt not in (1, 2, 3, 5):
+                _fail(line)
             blocksize, levels = struct.unpack_from('<II', fs, 0x28)
             hashoff, hashsize, pfsoff, pfssize = struct.unpack_from('<QQQQ', fs, 0x30)
             secstart, secsize = start * 512, (end - start) * 512
             require(levels == 2 and blocksize > 0 and pfssize <= 512 * 1024 * 1024,
-                    'Unsupported ExeFS hash layout')
+                    f'{line} Unsupported ExeFS hash layout')
+            key = None
+            if crypt == 2:
+                key = xts_key(hdr, keys, line)
+            elif crypt in (3, 5):
+                key = content_key(hdr, keys, ticket, line)
 
-            def section_read(relative, size):
-                require(relative >= 0 and relative + size <= secsize, 'Section read out of bounds')
+            def section_read(relative, size, crypt=crypt, key=key, secstart=secstart, secsize=secsize):
+                require(0 <= relative and relative + size <= secsize, f'{line} Section read out of bounds')
                 absolute = secstart + relative
-                aligned = absolute & ~15
-                iv = fs[0x140:0x148][::-1] + (aligned // 16).to_bytes(8, 'big')
-                data = read_at(handle, offset + aligned, size + absolute - aligned)
-                return decrypt(ctr_key, modes.CTR(iv), data)[absolute - aligned:]
+
+                def raw_at(origin, length):
+                    return read_at(handle, offset + origin, length)
+
+                def read_ctr(origin, length):
+                    aligned = origin & ~15
+                    iv = fs[0x140:0x148][::-1] + (aligned // 16).to_bytes(8, 'big')
+                    data = raw_at(aligned, length + origin - aligned)
+                    return decrypt(key, modes.CTR(iv), data)[origin - aligned:]
+
+                def read_xts(origin, length):
+                    start_sector = origin & ~511
+                    end = (origin + length + 511) & ~511
+                    blob = raw_at(secstart + start_sector, end - start_sector)
+                    plain = b''.join(
+                        decrypt(key, modes.XTS(((start_sector // 512) + sector).to_bytes(16, 'big')),
+                                blob[sector * 512:(sector + 1) * 512])
+                        for sector in range((end - start_sector) // 512))
+                    return plain[origin - start_sector:origin - start_sector + length]
+
+                if crypt == 1:
+                    return raw_at(absolute, size)
+                if crypt == 2:
+                    return read_xts(relative, size)
+                if crypt != 5 or relative >= pfsoff:
+                    return read_ctr(absolute, size)
+                if relative + size <= pfsoff:
+                    return raw_at(absolute, size)
+                head = pfsoff - relative
+                return raw_at(absolute, head) + read_ctr(absolute + head, size - head)
 
             hashes = section_read(hashoff, hashsize)
-            require(hashlib.sha256(hashes).digest() == fs[8:40], 'ExeFS hash-table mismatch')
+            require(hashlib.sha256(hashes).digest() == fs[8:40], f'{line} ExeFS hash-table mismatch')
             pfs = section_read(pfsoff, pfssize)
             for block, pos in enumerate(range(0, pfssize, blocksize)):
                 expected = hashes[block * 32:(block + 1) * 32]
                 require(hashlib.sha256(pfs[pos:pos + blocksize]).digest() == expected,
-                        f'ExeFS block hash mismatch: {block}')
-            files = [(member, pfs[off:off + size]) for member, off, size in
-                     partition_entries(io.BytesIO(pfs), 0, len(pfs))]
+                        f'{line} ExeFS block hash mismatch: {block}')
+            try:
+                members = partition_entries(io.BytesIO(pfs), 0, len(pfs))
+            except ValueError as error:
+                _fail(f'{line} {error}')
+            files = [(member, pfs[off:off + size]) for member, off, size in members]
             if any(member == 'main.npdm' for member, _payload in files):
                 return files
     if skipped:
@@ -268,10 +418,15 @@ def probe(nsp, keys_path, build, expected_sha256=None):
         if kind != 'nsp':
             _fail(f'{kind} is not the pinned NSP container')
         with nsp.open('rb') as handle:
-            tickets = common_tickets(handle, entries)
             records = nca_records(handle, entries, keys)
-        record, hdr = program_record(records)
-        files = exefs_members(nsp, keys, record, hdr, tickets)
+        try:
+            with nsp.open('rb') as handle:
+                tickets = read_tickets(handle, entries)
+            record, hdr = program_record(records)
+            files = exefs_members(nsp, keys, record, hdr, tickets)
+        except Exception as error:
+            inventory = error.inventory if isinstance(error, ProbeError) and error.inventory else nca_lines(records)
+            raise ProbeError(str(error), inventory) from None
         skipped = skipped_sections(records)
         reports = []
         for name, data in files:
@@ -313,6 +468,8 @@ def main(argv):
     try:
         sys.stdout.write(probe(args.nsp, args.keys, args.build_dir))
     except (ProbeError, ValueError, OSError) as error:
+        for line in getattr(error, 'inventory', ()):
+            print(line, file=sys.stderr)
         print(f'probe: {error}', file=sys.stderr)
         return 2
     return 0

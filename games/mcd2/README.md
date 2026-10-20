@@ -22,6 +22,8 @@ Success is exit 0 and stdout that starts with `status: ok`, then `nsp_sha256` eq
 
 If the ExeFS section itself does not fit, the probe exits 2 and the message names the NCA, the section index, `media_start`, `media_end`, `byte_start`, `byte_end`, `nca_offset`, and `nca_size`. It does not print key material or file bytes. A common ticket in the NSP is decrypted with `titlekek_XX` from `prod.keys`. This probe does not read `title.keys`.
 
+ExeFS encryption type 3 is AES-CTR. Type 0 is read as AES-CTR. Type 1 is plaintext. Type 2 is AES-XTS from key-area keys 0 and 1. Type 5 leaves the hash table plaintext and decrypts the PFS0 with AES-CTR. Types 4 and 6 with empty BKTR tables use that same CTR path. Any other value, a personalized ticket, or a non-empty BKTR table exits 2. Stderr prints every `nca:` line first, then `probe:` with `fs_type`, `hash_type`, `encryption_type`, `ticket_key_generation`, and `titlekey_type`.
+
 `sdk_version: absent` means the rodata string `sdk_version:` was not found. That is a report, not a failed probe.
 
 ## Rewrite and map
