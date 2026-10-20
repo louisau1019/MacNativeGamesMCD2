@@ -12,6 +12,8 @@ __pycache__/
 *.sav
 # build output (the work folder normally lives next to the card image)
 TOTK_build/
+MCD2_build/
+games/mcd2/build/
 *.app/
 games/totk/.venv
 games/totk/build/
